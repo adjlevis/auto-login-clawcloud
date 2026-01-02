@@ -1,15 +1,26 @@
 # 文件名: login_script.py
 # 作用: 自动登录 ClawCloud Run，支持 GitHub 账号密码 + 2FA 自动验证
+# 仅新增：Telegram 接收消息（成功 / 失败样本）
 
 import os
 import time
-import pyotp  # 用于生成 2FA 验证码
+import pyotp
 import requests
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 
+def mask_account(account: str) -> str:
+    """邮箱脱敏"""
+    if not account or "@" not in account:
+        return "unknown"
+    name, domain = account.split("@", 1)
+    if len(name) <= 3:
+        return f"{name[0]}***@{domain}"
+    return f"{name[:3]}***@{domain}"
+
+
 def send_tg_message(text: str):
-    """发送 Telegram 消息（不影响主流程）"""
     bot_token = os.environ.get("TG_BOT_TOKEN")
     chat_id = os.environ.get("TG_CHAT_ID")
 
@@ -17,10 +28,9 @@ def send_tg_message(text: str):
         print("ℹ️ 未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过 TG 通知")
         return
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
         requests.post(
-            url,
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": text
@@ -32,13 +42,20 @@ def send_tg_message(text: str):
 
 
 def run_login():
-    # 1. 获取环境变量中的敏感信息
     username = os.environ.get("GH_USERNAME")
     password = os.environ.get("GH_PASSWORD")
     totp_secret = os.environ.get("GH_2FA_SECRET")
 
+    now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    masked_user = mask_account(username)
+
     if not username or not password:
-        msg = "❌ ClawCloud 登录失败：缺少 GH_USERNAME 或 GH_PASSWORD"
+        msg = (
+            "❌ ClawCloud 登录失败\n\n"
+            f"👤 账号：{masked_user}\n"
+            f"🕒 时间：{now_time}\n"
+            "⚠️ 原因：缺少 GH_USERNAME 或 GH_PASSWORD"
+        )
         print(msg)
         send_tg_message(msg)
         return
@@ -49,57 +66,55 @@ def run_login():
         context = browser.new_context(viewport={'width': 1920, 'height': 1080})
         page = context.new_page()
 
-        # 2. 访问 ClawCloud 登录页
         target_url = "https://ap-northeast-1.run.claw.cloud/"
         print(f"🌐 [Step 2] 正在访问: {target_url}")
         page.goto(target_url)
         page.wait_for_load_state("networkidle")
 
-        # 3. 点击 GitHub 登录按钮
         print("🔍 [Step 3] 寻找 GitHub 按钮...")
         try:
-            login_button = page.locator("button:has-text('GitHub')")
-            login_button.wait_for(state="visible", timeout=10000)
-            login_button.click()
-            print("✅ 按钮已点击")
-        except Exception as e:
-            print(f"⚠️ 未找到 GitHub 按钮: {e}")
+            page.locator("button:has-text('GitHub')").click(timeout=10000)
+        except:
+            pass
 
-        # 4. GitHub 登录表单
         print("⏳ [Step 4] 等待跳转到 GitHub...")
         try:
             page.wait_for_url(lambda url: "github.com" in url, timeout=15000)
             if "login" in page.url:
-                print("🔒 输入账号密码...")
                 page.fill("#login_field", username)
                 page.fill("#password", password)
                 page.click("input[name='commit']")
-                print("📤 登录表单已提交")
-        except Exception as e:
-            print(f"ℹ️ 跳过账号密码填写: {e}")
+        except:
+            pass
 
-        # 5. 2FA
         page.wait_for_timeout(3000)
-        if "two-factor" in page.url or page.locator("#app_totp").count() > 0:
-            print("🔐 [Step 5] 检测到 2FA 双重验证请求！")
 
+        if "two-factor" in page.url or page.locator("#app_totp").count() > 0:
+            print("🔐 [Step 5] 检测到 2FA")
             if totp_secret:
                 try:
-                    totp = pyotp.TOTP(totp_secret)
-                    token = totp.now()
-                    print(f"生成的验证码: {token}")
+                    token = pyotp.TOTP(totp_secret).now()
                     page.fill("#app_totp", token)
                 except Exception as e:
-                    msg = f"❌ 2FA 验证码填写失败: {e}"
+                    msg = (
+                        "❌ ClawCloud 登录失败\n\n"
+                        f"👤 账号：{masked_user}\n"
+                        f"🕒 时间：{now_time}\n"
+                        f"⚠️ 原因：2FA 验证码填写失败\n{e}"
+                    )
                     print(msg)
                     send_tg_message(msg)
             else:
-                msg = "❌ 致命错误：检测到 2FA 但未配置 GH_2FA_SECRET"
+                msg = (
+                    "🚨 ClawCloud 登录中断（致命）\n\n"
+                    f"👤 账号：{masked_user}\n"
+                    f"🕒 时间：{now_time}\n"
+                    "❌ 检测到 2FA 但未配置 GH_2FA_SECRET"
+                )
                 print(msg)
                 send_tg_message(msg)
                 exit(1)
 
-        # 6. 授权页
         page.wait_for_timeout(3000)
         if "authorize" in page.url.lower():
             try:
@@ -107,16 +122,16 @@ def run_login():
             except:
                 pass
 
-        # 7. 等待最终跳转
         print("⏳ [Step 6] 等待跳转回 ClawCloud 控制台...")
         page.wait_for_timeout(20000)
 
         final_url = page.url
         page.screenshot(path="login_result.png")
 
-        # 8. 判断是否成功
         is_success = False
-        if page.get_by_text("App Launchpad").count() > 0 or page.get_by_text("Devbox").count() > 0:
+        if page.get_by_text("App Launchpad").count() > 0:
+            is_success = True
+        elif page.get_by_text("Devbox").count() > 0:
             is_success = True
         elif "private-team" in final_url or "console" in final_url:
             is_success = True
@@ -124,11 +139,23 @@ def run_login():
             is_success = True
 
         if is_success:
-            msg = f"🎉 ClawCloud 登录成功\n{final_url}"
+            msg = (
+                "🎉 ClawCloud 登录成功\n\n"
+                f"👤 账号：{masked_user}\n"
+                f"🕒 时间：{now_time}\n"
+                "🌐 控制台：\n"
+                f"{final_url}"
+            )
             print(msg)
             send_tg_message(msg)
         else:
-            msg = "❌ ClawCloud 登录失败，请查看 login_result.png"
+            msg = (
+                "❌ ClawCloud 登录失败\n\n"
+                f"👤 账号：{masked_user}\n"
+                f"🕒 时间：{now_time}\n"
+                "⚠️ 原因：GitHub 登录或 2FA 未通过\n\n"
+                "📸 已生成调试截图：login_result.png"
+            )
             print(msg)
             send_tg_message(msg)
             exit(1)
